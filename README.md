@@ -301,6 +301,8 @@ python run.py 6 --tokens 250
 - [ ] At least one Speed-of-Light or occupancy metric is better than `matmul_base`
 - [ ] A written explanation: what you changed, what the report shows, and why the numbers moved
 
+> Submitted write-up: [`SUBMISSION.md`](SUBMISSION.md) — 16×16 block + 32×32 tiling + 2×2 thread coarsening.
+
 ---
 
 ## 9. Troubleshooting
