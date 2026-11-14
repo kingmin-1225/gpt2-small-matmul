@@ -1,320 +1,95 @@
-# GPU Kernel Profiling Lab
-## Profiling and Optimizing the GPT-2 Attention Matrix Multiply with NVIDIA Nsight Compute
+# GPT-2 Attention Matmul CUDA 커널 최적화
 
-This lab explains how to profile and optimize the matrix-multiplication kernel that performs GPT-2 self-attention (QK᷊ and P·V). It covers why each kernel behaves the way it does and exactly which Nsight Compute (ncu) metrics respond to each change.
+GPT-2 어텐션의 두 배치 행렬곱(`Q × Kᵀ`, `Attention_score × V`)을 계산하는 CUDA 커널을 최적화하고, Nsight Compute로 분석한 프로젝트입니다.
 
----
+- Computer Architecture, Spring 2026 과제
+- 강의 실습 저장소 [hyuaisl/gpt2-small-matmul](https://github.com/hyuaisl/gpt2-small-matmul)을 fork해서 진행했습니다. 직접 작성한 커널은 [`matmul_skeleton.cu`](matmul_skeleton.cu)입니다.
+- 전체 보고서: [SUBMISSION.md](SUBMISSION.md) / 원본 실습 안내: [LAB.md](LAB.md)
 
-## Contents
+## 결과
 
-1. [What This Lab Measures](#1-what-this-lab-measures)
-2. [Prerequisites and Setup](#2-prerequisites-and-setup)
-3. [Running a Kernel](#3-running-a-kernel)
-4. [Profiling with Nsight Compute](#4-profiling-with-nsight-compute)
-5. [How to Read the Report](#5-how-to-read-the-report)
-6. [The Baseline, Dissected](#6-the-baseline-dissected)
-7. [The Three Optimization Strategies](#7-the-three-optimization-strategies)
-8. [Assignment — Optimize matmul_skeleton.cu](#8-assignment--optimize-matmul_skeletoncu)
-9. [Troubleshooting](#9-troubleshooting)
+**RTX 4060 Ti 8GB**, `python run.py <n> --tokens 250` (seq = 1001), ncu Duration 기준
 
----
+| 커널 | Duration | base 대비 |
+|---|---:|---:|
+| cuBLAS (`torch.matmul`) | 868.70 us | 83.6× |
+| **`matmul_skeleton` (직접 작성)** | **970.08 us** | **74.8×** |
+| `matmul_compute` (16×16 + TILE 16, 강의 제공) | 1824.99 us | 39.8× |
+| `matmul_latency` (16×16, 강의 제공) | 2.32 ms | 31.3× |
+| `matmul_memory` (32×32, 강의 제공) | 2.49 ms | 29.2× |
+| `matmul_base` (1×1, 강의 제공) | 72.6 ms | 1× |
 
-## 1. What This Lab Measures
+- 나이브 베이스라인 대비 **약 75×**, cuBLAS 성능의 **약 89%** (1.12× 느림)
+- 강의 제공 최적화 커널(`matmul_compute`) 대비 **약 1.88×**
+- Achieved occupancy **97.81%**
 
-All attention in this lab is computed in eager mode. The driver script (`run.py`) patches Hugging Face's GPT-2 eager attention so that the two attention matrix multiplies are routed through a kernel you select at runtime. Both multiplies are wrapped in an NVTX range named `matmul_op`, which lets ncu capture exactly those launches and nothing else.
+## 무엇을 바꿨나
 
-Concretely, for each attention head the kernel computes a batched product `C[b] = A[b] · B[b]`, where A is M×K, B is K×N, and b indexes the batch (batch = heads × sequence groups). The sequence length is controlled by `--tokens`; longer sequences enlarge M, K, and N, which makes every bottleneck more visible in the report.
+나이브 베이스라인(블록당 스레드 1개, 타일링 없음, 워프 이용률 약 3%)에 세 가지를 순서대로 적용했습니다.
 
-Six kernels share one identical numerical body. They differ only in launch geometry (block size), whether shared-memory tiling is enabled, and the kernel name. Because the math is identical, any difference you see in the ncu report is caused purely by how the work is mapped onto the GPU — which is the entire point of the lab.
+| # | 변경 | 노린 것 |
+|---|---|---|
+| 1 | 블록 16×16 (256 스레드 = 8 워프) | 워프 이용률, occupancy |
+| 2 | 32×32 공유 메모리 타일링 | 전역 메모리 재사용 |
+| 3 | 2×2 스레드 코어스닝 (스레드당 출력 4개) | 레지스터 재사용 |
 
-| # | Kernel | What it isolates |
-|---|--------|-----------------|
-| 1 | eager_matmul | PyTorch `torch.matmul` (cuBLAS) — the fast reference |
-| 2 | matmul_memory | Memory bandwidth: very large blocks (32×32) |
-| 3 | matmul_latency | Latency hiding / occupancy: enough warps per SM (16×16) |
-| 4 | matmul_compute | Block size **plus** shared-memory tiling (16×16, data reuse) |
-| 5 | matmul_base | Naive baseline (1×1) — deliberately bad |
-| 6 | matmul_skeleton | Your kernel — starts as a copy of the baseline |
+블록(16×16)과 타일(32×32)의 크기가 다릅니다. 스레드 하나가 타일 적재를 4회, 출력 계산을 2×2 담당합니다. 안쪽 루프에서 `sA`/`sB` 값을 레지스터(`a_reg[2]`, `b_reg[2]`)로 한 번 올린 뒤 곱셈 4회에 재사용하므로, **MAC당 공유 메모리 읽기가 절반**이 됩니다.
 
-### The cumulative optimization story
+## 파라미터 선택 근거
 
-There are really only **two independent levers** in these kernels:
+- **`BLOCK 16`**: RTX 4060 Ti는 SM당 최대 1536 스레드입니다. 256 스레드 블록이면 정확히 6블록이 동시에 상주해 이론 occupancy 100%가 됩니다. 공유 메모리도 8KB × 6 = 48KB로 SM 한도(100KB) 안에 들어갑니다.
+- **코어스닝 `2×2`**: 정방 타일 기준으로 비교했습니다.
 
-1. **Block size** — how many warps run per SM. Raising it fixes low occupancy, hides memory latency, and increases in-flight memory bandwidth, all at once.
-2. **Shared-memory tiling** — data reuse. Independent of block size; it reduces the *amount* of data moved rather than how fast it moves.
+  | 코어스닝 | 타일 | 공유 메모리/블록 | SM당 상주 블록 | MAC/element |
+  |---|---|---:|---:|---:|
+  | 1×1 | 16×16 | 2 KB | 6 | 8 |
+  | **2×2** | **32×32** | **8 KB** | **6** | **16** |
+  | 4×4 | 64×64 | 32 KB | 3 | 32 |
 
-`matmul_memory` and `matmul_latency` both pull the **same** lever (block size), just to different sizes, so they cannot be stacked — they are two points on one axis. The lab therefore tells the story with two cumulative steps, each pulling a different lever:
+  2×2는 occupancy를 깎지 않으면서 재사용을 두 배로 늘리는 지점입니다. 4×4는 k-깊이를 32로 두면 공유 메모리 문제는 피할 수 있지만, 누산기 16개로 레지스터 한도(42 reg/thread)를 넘길 가능성이 커서 멈췄습니다.
 
-```
-kernel 5 (base)         1×1 block, no tiling          ~47 ms   <- baseline
-   │  raise block size (lever 1)
-   ▼
-kernel 3 (latency)      16×16 block, no tiling        ~1.4 ms  <- occupancy fixed
-   │  add tiling on top (lever 2)
-   ▼
-kernel 4 (compute)      16×16 block + tiling          ~1.0 ms  <- reuse added
-```
+## 병목 분석
 
-`matmul_compute` already uses a 16×16 block (because `TILE=16` sets the block dimension), so it carries lever 1 forward *and* adds lever 2 — it is the baseline with **both** optimizations applied.
+- **최적화 전**: 전역 메모리 레이턴시 바운드. 모든 MAC이 전역 메모리를 직접 읽고, 블록당 스레드가 1개라 스톨을 가려줄 워프가 없습니다.
+- **최적화 후**: 낮은 arithmetic intensity. occupancy가 97.81%로 스케줄링은 포화됐고, 남은 병목은 메모리 트래픽입니다. 타일드 GEMM의 arithmetic intensity는 `Tm·Tn / (Tm+Tn)`으로 K와 무관하므로, 32×32 타일에서는 16 MAC/element로 고정됩니다.
+- **두 matmul의 형상이 다릅니다.** `Q × Kᵀ`는 K=64지만, `P × V`의 축약 차원은 시퀀스 길이(K=1001)입니다.
 
-`matmul_memory` (kernel 2, 32×32) is shown for its code only: it is the same lever as `matmul_latency` and actually regresses here (a 1024-thread block packs fewer blocks per SM and suffers tail effects), which is itself a useful lesson that "bigger block" is not monotonically better.
+## 정확성 검증
 
-> **Magnitude note:** step 1 (base → latency) is dramatic (~33×). Step 2 (latency → compute) is modest (~1.4×): with GPT-2's small contraction dimension (K = 64) there is little data to reuse, so tiling's benefit is limited. Use **Duration** as the honest headline metric throughout.
+두 어텐션 matmul의 실제 형상으로 `torch.matmul`과 비교했고, 둘 다 `allclose` 통과했습니다. 두 형상 모두 타일 32의 배수가 아니라서 경계 처리 경로도 함께 검증됩니다.
 
----
-
-## 2. Prerequisites and Setup
-
-- An NVIDIA GPU with CUDA support
-- Python 3.x with a CUDA-enabled PyTorch build
-- NVIDIA Nsight Compute, with the `ncu` command on your PATH
-- A host C++ compiler reachable by NVCC (MSVC/Visual Studio on Windows, GCC on Linux)
-
-Verify the toolchain before profiling:
-```bash
-python -c "import torch; print(torch.cuda.is_available())"   # must print True
-ncu --version
+```python
+import torch, torch.utils.cpp_extension as C
+ext = C.load(name="matmul_skeleton", sources=["matmul_skeleton.cu"])
+for M, K, N in [(1001, 64, 1001), (1001, 1001, 64)]:   # Q×Kᵀ, P×V
+    A = torch.randn(12, M, K, device="cuda"); B = torch.randn(12, K, N, device="cuda")
+    print(M, K, N, torch.allclose(ext.batched_matmul(A, B), A @ B, rtol=1e-4, atol=1e-4))
 ```
 
-On Windows, kernels 2–6 are JIT-compiled by PyTorch on first use and require the MSVC environment (run from "x64 Native Tools Command Prompt for VS", or call `vcvars64.bat` first). First compilation takes roughly 30–60 seconds; later runs load from the build cache instantly.
+## 한계와 다음 단계
 
----
+- 1회 측정, `--tokens 250` 한 가지 형상에서만 측정했습니다.
+- 타일과 코어스닝 값은 GPT-2 어텐션의 두 형상에 맞춘 값이라, 다른 GEMM에는 다시 조정해야 합니다.
+- Memory Throughput과 DRAM Throughput을 따로 기록하지 않아서, 병목이 L2/L1 대역인지 DRAM인지는 확정하지 못했습니다.
+- cuBLAS와의 11% 격차를 줄일 후보:
+  - 4×4 코어스닝 + k-깊이 32 (레지스터 한도를 실측으로 확인 필요)
+  - 비대칭 4×2 타일
+  - `sA[TILE][TILE+1]` 패딩으로 2-way 뱅크 충돌 제거
+  - 전역 → 공유 메모리 적재를 `float4`로 벡터화
 
-## 3. Running a Kernel
+## 실행 방법
 
-```bash
-python run.py <kernel_number> [--tokens N]
-```
+요구 사항: CUDA 지원 NVIDIA GPU, CUDA 빌드 PyTorch, Nsight Compute(`ncu`), NVCC용 호스트 컴파일러 (Windows는 MSVC). 자세한 설정은 [LAB.md](LAB.md)를 참고하세요.
 
 ```bash
-python run.py 5 --tokens 250   # naive baseline
-python run.py 6 --tokens 250   # your kernel
+python run.py 6 --tokens 250   # matmul_skeleton 실행
 ```
 
-The default `--tokens 250` repeats the seed phrase to produce roughly 1000 tokens (truncated to GPT-2's 1024-token context). A plain run does not profile anything — it confirms the kernel compiles and runs, then prints the exact ncu command to capture it.
-
----
-
-## 4. Profiling with Nsight Compute
-
-> **Windows:** run ncu from an **Administrator** terminal — GPU performance counters require elevated privileges.
-
 ```bash
+# Windows에서는 관리자 권한 터미널에서 실행
 ncu --nvtx --nvtx-include "matmul_op/" --set basic \
     --metrics smsp__thread_inst_executed_per_inst_executed.ratio -f -c 4 \
-    -o <report_name> python run.py <number> --tokens 250
+    -o skeleton_report python run.py 6 --tokens 250
 ```
 
-```sweep from 2 ~ 5
-for %k in (2 3 4 5) do ncu --nvtx --nvtx-include "matmul_op/" --set basic --metrics smsp__thread_inst_executed_per_inst_executed.ratio -f -c 4 -o kernel%k_report python run.py %k --tokens 250
-```
-**Flag by flag:**
-
-| Flag | Purpose |
-|------|---------|
-| `--nvtx --nvtx-include "matmul_op/"` | Capture only kernels launched inside the `matmul_op` NVTX range — the attention matmul and nothing else (no softmax, no copies) |
-| `--set basic` | Collect the standard metric set: Speed-of-Light throughputs, occupancy, and launch statistics |
-| `--metrics smsp__thread_inst_executed_per_inst_executed.ratio` | Add **warp execution efficiency** — active threads per warp instruction (out of 32). The honest "is the kernel wasting the GPU?" metric; the baseline reads ~1 (3%), an optimized kernel ~32 |
-| `-c 4` | Capture only the first four matmul launches — enough to characterize the kernel, keeps profiling fast |
-| `-f -o <name>` | Overwrite and write `<name>.ncu-rep`, opened in the Nsight Compute GUI |
-
-Example — capture the baseline, then your kernel:
-```bash
-ncu --nvtx --nvtx-include "matmul_op/" --set basic --metrics smsp__thread_inst_executed_per_inst_executed.ratio -f -c 4 -o base_report     python run.py 5 --tokens 250
-ncu --nvtx --nvtx-include "matmul_op/" --set basic --metrics smsp__thread_inst_executed_per_inst_executed.ratio -f -c 4 -o skeleton_report python run.py 6 --tokens 250
-```
-
-Profile all six kernels at once (cmd):
-```cmd
-for %k in (1 2 3 4 5 6) do ncu --nvtx --nvtx-include "matmul_op/" --set basic --metrics smsp__thread_inst_executed_per_inst_executed.ratio -f -c 4 -o kernel%k_report python run.py %k --tokens 250
-```
-
----
-
-## 5. How to Read the Report
-
-Open the `.ncu-rep` file and read these three sections in order.
-
-### 5.1 GPU Speed of Light (SOL)
-
-The Speed-of-Light section reports what fraction of the hardware's peak each subsystem reached. It is your first diagnostic: a well-optimized kernel pushes at least one of these close to 100%, whereas the naive baseline leaves all of them low.
-
-| Metric | Meaning |
-|--------|---------|
-| **Compute (SM) Throughput** | How busy the arithmetic units are, as a percent of peak |
-| **Memory Throughput** | How busy the on-chip memory pipeline (L1/L2) is |
-| **DRAM Throughput** | How much of raw device-memory bandwidth is consumed |
-| **Duration** | Wall-clock time for the kernel launch |
-
-Reading the pair matters more than either number alone. High memory throughput with low compute throughput means the kernel is memory-bound; the reverse means it is compute-bound. The baseline is neither — it is latency-bound, with everything low because the SM spends most of its cycles stalled and idle.
-
-### 5.2 Occupancy
-
-Occupancy is the ratio of active warps on an SM to the hardware maximum. Theoretical occupancy is the ceiling set by your launch configuration and per-thread resource use; achieved occupancy is what actually ran. A large gap between them, or a low theoretical ceiling, tells you why the SM sat idle.
-
-- **Low because of block size:** too few threads per block (the baseline's 16) cannot fill the SM.
-- **Low because of registers:** high registers-per-thread limits how many blocks fit at once.
-- **Low because of shared memory:** a large tile can cap the number of resident blocks per SM.
-
-Occupancy is not a goal in itself — it is a means to hide latency. Enough warps let the scheduler swap a stalled warp for a ready one, keeping the pipelines fed.
-
-### 5.3 Launch Statistics
-
-- **Block Size** — small values explain poor warp utilization. The baseline's 1×1 block is the root cause of its slowness: each warp runs with only 1 of 32 lanes active.
-- **Registers Per Thread** — high values reduce how many blocks fit per SM, capping theoretical occupancy.
-- **Waves Per SM** — how many rounds of blocks the GPU processed. A fractional last wave means the grid does not evenly fill the device (the "tail").
-
----
-
-## 6. The Baseline, Dissected
-
-Every optimized kernel is a one-line change away from `matmul_base.cu`. Understanding the baseline precisely is therefore the key to the whole lab. The inner loop is:
-
-```cuda
-// BDIM = BLOCK = 1: one thread per block
-int row = blockIdx.y * BDIM + threadIdx.y;
-int col = blockIdx.x * BDIM + threadIdx.x;
-if (row >= M || col >= N) return;
-float sum = 0.0f;
-for (int k = 0; k < K; k++)
-    sum += a[row * K + k] * bm[k * N + col];   // two global loads per iteration
-c[row * N + col] = sum;
-```
-
-The baseline is slow for two distinct reasons, each addressed by one of the two optimization levers:
-
-**Problem 1 — Catastrophic warp under-utilization (fixed by block size).** `BLOCK = 1` means 1 thread per block. The hardware always executes full 32-thread warps, so each warp runs with only **1 of its 32 lanes active** — about 3% warp execution efficiency. The other 31 lanes are masked off every cycle. Equivalently, almost no independent work is available per warp, so when a thread stalls on a ~hundreds-of-cycles global load, the scheduler has little else to run. This single defect dominates the baseline's ~47 ms runtime.
-
-**Problem 2 — No data reuse (fixed by tiling).** Each output element streams an entire row of A and an entire column of B from global memory, and neighboring outputs re-fetch the same rows and columns. The same bytes cross the memory bus many times. Tiling is what removes this; block size cannot.
-
-> **Read the right metric.** It is tempting to point at *occupancy* to explain why the baseline is bad, but achieved occupancy here is a deceptively moderate ~49 % — the SM packs many 1-thread blocks, so it looks half-full of warps even though each warp is 31/32 idle. The honest headline is **Duration** (≈47 ms vs ≈1 ms optimized), and the supporting metric is **warp execution efficiency**, not occupancy.
-
----
-
-## 7. The Optimization Strategy (Two Cumulative Steps)
-
-The lab demonstrates optimization as two cumulative steps, each pulling one of the two independent levers. Profile them in this order against the baseline.
-
-### Step 1 — Fix warp utilization with block size → `matmul_latency` (kernel 3)
-
-**Change from baseline:** `BLOCK = 1` → `BLOCK = 16`. A 16×16 block is 256 threads = 8 full warps.
-
-**What it fixes:** Problem 1. Now every warp runs with all 32 lanes active, and several blocks reside per SM, giving the scheduler a deep pool of eligible warps. While one warp waits on a global load, another runs — stall cycles are overlapped with useful work instead of wasted.
-
-**Measured on an RTX 5060 (seq ≈ 1001, `--tokens 250`):**
-
-| Metric | base | latency | change |
-|--------|---:|---:|:--|
-| Warp execution efficiency | 1.00 / 32 | 31.86 / 32 | 3% → **99.6%** |
-| Duration | 47.18 ms | 1.39 ms | **~34× faster** |
-| Achieved Occupancy | 48.8% | 94.2% | +45 pp |
-| DRAM Throughput | 0.8% | 8.4% | memory finally used |
-
-**Key metric to watch:** `warp execution efficiency` (the smoking gun) and `Duration`.
-
----
-
-### Step 2 — Add data reuse on top with tiling → `matmul_compute` (kernel 4)
-
-**Change from step 1:** keep the 16×16 block, **add** shared-memory tiling (`TILE = 16` sets both the tile and the block dimension). This kernel is the baseline with **both** levers applied.
-
-**What it fixes:** Problem 2, on top of step 1. The K dimension is walked in 16-wide tiles. Each iteration cooperatively loads one 16×16 tile of A and one of B into shared memory, the block synchronizes, then every thread reuses those cached values for 16 multiply-accumulates before loading the next tile:
-
-```cuda
-for (int t = 0; t < (K + TILE - 1) / TILE; t++) {
-    sA[ty][tx] = (row < M && aCol < K) ? a[row*K + aCol] : 0.0f;
-    sB[ty][tx] = (bRow < K && col < N) ? bm[bRow*N + col] : 0.0f;
-    __syncthreads();                     // wait until the tile is fully loaded
-    for (int k = 0; k < TILE; k++)       // 16 MACs from fast shared memory
-        sum += sA[ty][k] * sB[k][tx];
-    __syncthreads();                     // wait before overwriting the tile
-}
-```
-
-Each global element is now read once and reused TILE times, raising arithmetic intensity (FLOPs per byte). The two `__syncthreads()` calls are mandatory: the first guarantees the tile is fully written before any thread reads it; the second prevents a thread from overwriting the tile while others still read it.
-
-**Measured on an RTX 5060 (seq ≈ 1001, `--tokens 250`):**
-
-| Metric | latency | compute | change |
-|--------|---:|---:|:--|
-| Duration | 1.39 ms | 1.02 ms | **~1.36× faster** |
-| Compute (SM) Throughput | 92.8% | 95.8% | +3 pp |
-| Achieved Occupancy | 94.2% | 97.2% | +3 pp |
-| Warp execution efficiency | 31.86 | 31.99 | already saturated |
-
-The step-2 gain is modest because GPT-2's contraction dimension (K = 64) leaves little to reuse — a useful lesson about when tiling pays off. Note that SOL *Memory Throughput* does **not** drop here (shared-memory accesses still register on the L1 pipe); the honest step-2 signals are `Duration` and `Compute (SM) Throughput`.
-**Key metric to watch:** `Compute (SM) Throughput` and `Duration`
-
----
-
-### Side note — `matmul_memory` (kernel 2): same lever, shown as code only
-
-`matmul_memory` sets `BLOCK = 32` (1024 threads). This pulls the **same** lever as step 1 (block size), just larger — so it is *not* a separate optimization to stack. In fact it regresses here: a 1024-thread block packs fewer blocks per SM and suffers tail effects, giving **lower** occupancy (62.3% vs 94.2%) and a **longer** duration (1.56 ms vs 1.39 ms) than the 16×16 `matmul_latency`, even though its warp efficiency is just as good (31.65 / 32). It is included so you can read its code and see that "bigger block" is not monotonically better — there is a sweet spot.
-
-**Summary table (measured, RTX 5060, seq ≈ 1001):**
-
-| Step | Kernel | Change | Duration | Warp eff. | Occupancy | SM Tput |
-|------|--------|--------|---:|---:|---:|---:|
-| baseline | matmul_base | `BLOCK = 1` | 47.18 ms | 1.00 | 48.8% | 90.2% |
-| 1 | matmul_latency | `BLOCK = 16` | 1.39 ms | 31.86 | 94.2% | 92.8% |
-| 2 | matmul_compute | + `TILE = 16` | 1.02 ms | 31.99 | 97.2% | 95.8% |
-| (aside) | matmul_memory | `BLOCK = 32` | 1.56 ms | 31.65 | 62.3% | 83.3% |
-
-> Numbers are from one RTX 5060 run; expect variation across GPUs, but the *ordering* and the ~34× / ~1.36× step pattern should hold.
-
----
-
-## 8. Assignment — Optimize `matmul_skeleton.cu`
-
-`matmul_skeleton.cu` begins as an exact copy of the naive baseline. Your task is to make it measurably faster than `matmul_base` and to explain why it got faster using the report.
-
-Everything below the `#include` line is yours to change. The two parameters at the top are your starting point:
-
-```c
-#define TILE  0    // 0: no tiling  |  N>0: shared-memory tile of size NxN
-#define BLOCK 4    // block side length (used when TILE == 0)
-```
-
-### 8.1 Recommended Procedure
-
-1. Profile `matmul_base` (kernel 5) and record Duration, SM throughput, Memory throughput, and Achieved Occupancy as your baseline.
-2. Profile the two cumulative steps (kernel 3, then kernel 4) and confirm on your own hardware: block size first collapses Duration, then tiling trims it further.
-3. Edit `matmul_skeleton.cu`. Apply the levers in the same order: first raise `BLOCK` (e.g. 16) to fix warp utilization — this is the single biggest win. Then, for a further gain, enable tiling (`TILE = 16`) to add data reuse on top.
-4. Recompile (see below), then profile `matmul_skeleton` (kernel 6) and compare against your baseline.
-5. Write up what you changed, which metrics moved, and the causal reason for each change.
-
-### 8.2 Recompiling After Each Edit
-
-PyTorch caches the compiled extension. After editing the `.cu` file you must clear that kernel's cache, or your change will not take effect:
-
-```cmd
-rmdir /s /q "%LOCALAPPDATA%\torch_extensions\torch_extensions\Cache\py312_cu128\matmul_skeleton"
-python run.py 6 --tokens 250
-```
-
-> The `py312_cu128` segment encodes your Python and CUDA versions; adjust it if yours differ.
-
-### 8.3 Submission Checklist
-
-- [ ] `python run.py 6` completes without errors
-- [ ] The ncu report shows the `matmul_skeleton` kernel being captured
-- [ ] At least one Speed-of-Light or occupancy metric is better than `matmul_base`
-- [ ] A written explanation: what you changed, what the report shows, and why the numbers moved
-
-> Submitted write-up: [`SUBMISSION.md`](SUBMISSION.md) — 16×16 block + 32×32 tiling + 2×2 thread coarsening.
-
----
-
-## 9. Troubleshooting
-
-### Compilation hangs forever
-A run killed with Ctrl+C can leave a stale lock file that blocks the next build. `run.py` deletes these automatically on startup; if it still hangs, close and reopen the terminal.
-
-### ncu permission error on Windows
-Run the terminal as Administrator — GPU performance counters require elevated privileges.
-
-### `torch.cuda.is_available()` returns False
-You have a CPU-only PyTorch build, or its CUDA version does not match your driver. Check your install:
-```bash
-python -c "import torch; print(torch.__version__, torch.version.cuda)"
-```
+환경: Windows 11 / Ryzen 5 7500F / RAM 32GB / RTX 4060 Ti 8GB
